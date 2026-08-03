@@ -3,8 +3,12 @@ import asyncio
 import json
 import os
 from datetime import datetime
+from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright
 from fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 # 初始化 FastMCP 服务器
 mcp = FastMCP("xiaohongshu_scraper")
@@ -29,6 +33,232 @@ browser_context = None
 main_page = None
 is_logged_in = False
 cookie_injected = False
+
+
+# ============ 手机扫码登录支持（无电脑用户也能登录） ============
+COOKIE_FILE = os.path.join(DATA_DIR, "xhs_cookie.txt")
+
+
+def _load_cookie_from_file():
+    """环境变量优先，其次从本地文件加载已保存的登录态"""
+    global XHS_COOKIE
+    if not XHS_COOKIE and os.path.exists(COOKIE_FILE):
+        try:
+            with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+                XHS_COOKIE = f.read().strip()
+            if XHS_COOKIE:
+                print(f"已从本地文件加载 Cookie（{len(XHS_COOKIE)} 字符）")
+        except Exception as e:
+            print(f"加载 Cookie 文件失败: {e}")
+
+
+LOGIN_PAGE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>小红书扫码登录</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f5f7;margin:0;display:flex;justify-content:center;align-items:center;min-height:100vh;}
+.card{background:#fff;border-radius:16px;padding:32px 28px;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:380px;width:90%;}
+h2{color:#ff2e4d;margin:0 0 8px;font-size:22px;}
+.sub{color:#888;font-size:14px;margin-bottom:20px;}
+#qrimg{width:260px;height:260px;border-radius:8px;border:1px solid #eee;object-fit:contain;background:#fff;}
+#status{font-size:15px;color:#333;margin-top:16px;min-height:22px;}
+#status.success{color:#00b578;font-weight:600;}
+#status.failed{color:#ff2e4d;}
+.hint{font-size:12px;color:#aaa;margin-top:14px;line-height:1.7;}
+.hint b{color:#888;}
+.spin{display:inline-block;width:16px;height:16px;border:2px solid #ffb3c0;border-top-color:#ff2e4d;border-radius:50%;animation:spin 1s linear infinite;vertical-align:-3px;margin-right:6px;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.btn{display:inline-block;margin-top:14px;padding:8px 22px;border-radius:20px;background:#ff2e4d;color:#fff;text-decoration:none;font-size:14px;}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>小红书扫码登录</h2>
+  <div class="sub">用于云端小红书 MCP 服务</div>
+  <img id="qrimg" style="display:none" alt="登录二维码">
+  <div id="status"><span class="spin"></span>正在生成二维码…</div>
+  <div id="retry" style="display:none"><a class="btn" href="/login?refresh=1">重新获取二维码</a></div>
+  <div class="hint">1. 二维码出现后，用<strong>手机小红书 App</strong> 右上角「扫一扫」<br>2. 在手机上确认登录<br>3. 本页面会自动检测并保存登录态</div>
+</div>
+<script>
+async function poll(){
+  try{
+    const r = await fetch('/login/status').then(r=>r.json());
+    const st = document.getElementById('status');
+    const img = document.getElementById('qrimg');
+    const retry = document.getElementById('retry');
+    if(r.status==='waiting_scan'){
+      img.style.display='inline-block';
+      st.innerHTML='请用小红书 App 扫码登录';
+      st.className='';
+      retry.style.display='none';
+    } else if(r.status==='success'){
+      img.style.display='none';
+      st.innerHTML='✅ 登录成功！可以关闭本页面了';
+      st.className='success';
+      retry.style.display='none';
+      return;
+    } else if(r.status==='failed'){
+      img.style.display='none';
+      st.innerHTML='❌ '+(r.error||'获取二维码失败');
+      st.className='failed';
+      retry.style.display='block';
+      return;
+    } else {
+      img.style.display='none';
+      st.innerHTML='<span class="spin"></span>正在生成二维码…';
+    }
+  }catch(e){}
+  setTimeout(poll,2000);
+}
+poll();
+</script>
+</body>
+</html>"""
+
+
+class QRLoginManager:
+    """云端扫码登录：生成小红书登录二维码页面，用户手机扫码后自动保存登录态"""
+
+    def __init__(self):
+        self.status = "idle"      # idle | waiting_scan | success | failed
+        self.error = ""
+        self.qr_png: Optional[bytes] = None
+        self._task: Optional[asyncio.Task] = None
+        self._started = False
+
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        self._task = asyncio.create_task(self._qr_flow())
+
+    def restart(self):
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self.status = "idle"
+        self.error = ""
+        self.qr_png = None
+        self._started = False
+        self.start()
+
+    async def _qr_flow(self):
+        """后台流程：打开登录页 → 截图二维码 → 轮询扫码结果"""
+        global is_logged_in, XHS_COOKIE, browser_context
+        try:
+            if XHS_COOKIE:
+                self.status = "success"
+                return
+            await ensure_browser()
+            if browser_context is None:
+                self.status = "failed"
+                self.error = "浏览器初始化失败，请稍后重试"
+                return
+
+            qr_page = await browser_context.new_page()
+            qr_page.set_default_timeout(60000)
+            try:
+                # 1. 打开小红书首页并点击「登录」
+                await qr_page.goto("https://www.xiaohongshu.com", timeout=60000)
+                await asyncio.sleep(4)
+                clicked = False
+                for sel in ('text="登录"', "text=登录"):
+                    try:
+                        loc = qr_page.locator(sel).first
+                        if await loc.count() > 0:
+                            await loc.click(timeout=8000)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                await asyncio.sleep(3)
+
+                # 2. 定位二维码元素并截图
+                qr_el = None
+                for sel in (
+                    "img[src*='qrcode' i]",
+                    "img[src*='qr_code' i]",
+                    "img[class*='qrcode' i]",
+                    "canvas",
+                    "img[src^='data:image' i]",
+                ):
+                    try:
+                        loc = qr_page.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            qr_el = loc
+                            break
+                    except Exception:
+                        continue
+
+                if qr_el is not None:
+                    self.qr_png = await qr_el.screenshot()
+                else:
+                    # 兜底：整页截图
+                    self.qr_png = await qr_page.screenshot()
+
+                if not self.qr_png:
+                    self.status = "failed"
+                    self.error = "未能获取二维码，请重试"
+                    return
+                self.status = "waiting_scan"
+                print("二维码已生成，等待用户手机扫码...")
+
+                # 3. 轮询登录状态（最长 5 分钟）
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 300
+                while loop.time() < deadline:
+                    await asyncio.sleep(3)
+                    try:
+                        cookies = await browser_context.cookies("https://www.xiaohongshu.com")
+                    except Exception:
+                        cookies = []
+                    names = {c.get("name", "") for c in cookies}
+                    if "web_session" in names or (len(cookies) > 12 and "webId" in names and "gid" in names):
+                        cookie_str = "; ".join(
+                            f"{c['name']}={c['value']}" for c in cookies
+                            if "xiaohongshu" in c.get("domain", "")
+                        )
+                        if cookie_str:
+                            XHS_COOKIE = cookie_str
+                            try:
+                                with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+                                    f.write(cookie_str)
+                            except Exception as e:
+                                print(f"保存 Cookie 文件失败: {e}")
+                            print(f"XHS_LOGIN_SUCCESS_COOKIE={cookie_str}")
+                            is_logged_in = True
+                            self.status = "success"
+                            print("✅ 扫码登录成功！登录态已保存")
+                            return
+                self.status = "failed"
+                self.error = "等待扫码超时（5分钟），请点击下方按钮重新获取二维码"
+            finally:
+                try:
+                    await qr_page.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.status = "failed"
+            self.error = str(e)[:200]
+            print(f"扫码登录流程异常: {e}")
+
+    async def page(self, request):
+        return HTMLResponse(LOGIN_PAGE_HTML)
+
+    async def restart(self, request):
+        self.restart()
+        return JSONResponse({"status": "restarted"})
+
+    async def qrcode_img(self, request):
+        if not self.qr_png:
+            return Response(status_code=404, content=b"QR not ready")
+        return Response(content=self.qr_png, media_type="image/png")
+
+    async def status(self, request):
+        return JSONResponse({"status": self.status, "error": self.error})
 
 
 def parse_cookie_string(cookie_str: str) -> List[Dict[str, Any]]:
@@ -149,14 +379,14 @@ async def login() -> str:
         return "已登录小红书账号"
     
     if HEADLESS:
-        # 云端 headless 模式：无法弹窗扫码，必须用 Cookie
+        # 云端 headless 模式：无法弹窗扫码，使用手机扫码登录
         if not XHS_COOKIE:
             return (
-                "云端模式无法扫码登录。请在 Railway 环境变量中配置 XHS_COOKIE：\n"
-                "1. 在本地电脑浏览器登录 www.xiaohongshu.com\n"
-                "2. F12 开发者工具 → Application → Cookies → 复制所有 cookie 键值对（分号分隔）\n"
-                "3. 将 cookie 字符串填入 XHS_COOKIE 环境变量并重新部署\n"
-                "注意：cookie 需包含 a1、webId、gid 等关键字段，且不能勾选 HttpOnly 限制的字段"
+                "云端模式尚未登录。请用手机打开扫码登录页面完成登录：\n"
+                "1. 手机浏览器访问 https://redbook-mcp-production.up.railway.app/login\n"
+                "2. 用小红书 App 右上角「扫一扫」扫描页面上的二维码并确认登录\n"
+                "3. 页面显示「登录成功」后即可返回 Kelivo 使用\n"
+                "如果二维码过期，点页面上的「重新获取二维码」即可"
             )
         return "Cookie 已配置但登录校验失败，请检查 XHS_COOKIE 是否过期，需重新获取"
     
@@ -1547,7 +1777,34 @@ async def post_comment(url: str, comment: str) -> str:
         return f"发布评论时出错: {str(e)}"
 
 if __name__ == "__main__":
-    # 初始化并运行服务器（streamable-http 远程模式，供 Kelivo 等客户端通过 URL 连接）
+    import uvicorn
+
+    # 从本地文件加载已保存的登录态（环境变量优先）
+    _load_cookie_from_file()
+
+    # 二维码扫码登录管理器（无电脑用户：手机扫码即可登录）
+    qr_login = QRLoginManager()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        qr_login.start()
+        yield
+
+    # 组装：MCP 端点 /mcp + 手机扫码登录页面 /login
+    mcp_app = mcp.http_app(path="/mcp", transport="streamable-http")
+    app = Starlette(
+        lifespan=lifespan,
+        routes=[
+            Route("/login", qr_login.page),
+            Route("/login/restart", qr_login.restart),
+            Route("/qrcode.png", qr_login.qrcode_img),
+            Route("/login/status", qr_login.status),
+            Mount("/", app=mcp_app),
+        ],
+    )
+
     print("启动小红书MCP服务器...")
-    print(f"模式: {'headless(云端)' if HEADLESS else 'headed(本地)'} | 端口: {XHS_PORT} | Cookie: {'已配置' if XHS_COOKIE else '未配置'}")
-    mcp.run(transport="streamable-http", host=XHS_HOST, port=XHS_PORT)
+    print(f"模式: headless(云端) | 端口: {XHS_PORT} | Cookie: {'已配置' if XHS_COOKIE else '未配置'}")
+    if not XHS_COOKIE:
+        print("未配置 Cookie → 已启用手机扫码登录：访问 /login 页面用小红书 App 扫码")
+    uvicorn.run(app, host=XHS_HOST, port=XHS_PORT, log_level="info")
