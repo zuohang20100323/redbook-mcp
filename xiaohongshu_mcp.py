@@ -2,7 +2,6 @@ from typing import Any, List, Dict, Optional
 import asyncio
 import json
 import os
-import pandas as pd
 from datetime import datetime
 from playwright.async_api import async_playwright
 from fastmcp import FastMCP
