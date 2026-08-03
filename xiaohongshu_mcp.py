@@ -136,7 +136,7 @@ class QRLoginManager:
         self._started = True
         self._task = asyncio.create_task(self._qr_flow())
 
-    def restart(self):
+    def _restart_flow(self):
         if self._task and not self._task.done():
             self._task.cancel()
         self.status = "idle"
@@ -249,7 +249,7 @@ class QRLoginManager:
         return HTMLResponse(LOGIN_PAGE_HTML)
 
     async def restart(self, request):
-        self.restart()
+        self._restart_flow()
         return JSONResponse({"status": "restarted"})
 
     async def qrcode_img(self, request):
@@ -257,7 +257,7 @@ class QRLoginManager:
             return Response(status_code=404, content=b"QR not ready")
         return Response(content=self.qr_png, media_type="image/png")
 
-    async def status(self, request):
+    async def status_endpoint(self, request):
         return JSONResponse({"status": self.status, "error": self.error})
 
 
@@ -1802,7 +1802,7 @@ if __name__ == "__main__":
             Route("/login", qr_login.page),
             Route("/login/restart", qr_login.restart),
             Route("/qrcode.png", qr_login.qrcode_img),
-            Route("/login/status", qr_login.status),
+            Route("/login/status", qr_login.status_endpoint),
             Mount("/", app=mcp_app),
         ],
     )
