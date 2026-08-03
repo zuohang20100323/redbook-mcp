@@ -1785,13 +1785,17 @@ if __name__ == "__main__":
     # 二维码扫码登录管理器（无电脑用户：手机扫码即可登录）
     qr_login = QRLoginManager()
 
+    # MCP 端点 /mcp（streamable-http）
+    mcp_app = mcp.http_app(path="/mcp", transport="streamable-http")
+
     @asynccontextmanager
     async def lifespan(app):
-        qr_login.start()
-        yield
+        # 必须先初始化 FastMCP 的 lifespan（StreamableHTTPSessionManager 等）
+        async with mcp_app.lifespan(app):
+            qr_login.start()
+            yield
 
     # 组装：MCP 端点 /mcp + 手机扫码登录页面 /login
-    mcp_app = mcp.http_app(path="/mcp", transport="streamable-http")
     app = Starlette(
         lifespan=lifespan,
         routes=[
